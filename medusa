@@ -1,0 +1,259 @@
+#!/usr/bin/python
+
+### HOW TO
+#   medusa [PHASE] [CLIENT_INDEX] [OPTIONS]
+#       PHASE: A, B
+#       CLIENT_INDEX: number[0..999]
+#       OPTIONS: ['pulldb', 'switchdb', 'syncdb']
+
+import json
+import sys
+import paramiko
+import subprocess
+import shlex
+from prettytable import PrettyTable
+import logging
+from datetime import datetime
+
+def setup_custom_logger(name):
+    formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
+                                  datefmt='%H:%M:%S')
+    #handler = logging.FileHandler('log.txt', mode='w')
+    #handler.setFormatter(formatter)
+    screen_handler = logging.StreamHandler(stream=sys.stdout)
+    screen_handler.setFormatter(formatter)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    #logger.addHandler(handler)
+    logger.addHandler(screen_handler)
+    return logger
+
+logger = setup_custom_logger('medusa')
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+#INTRODUCTION
+print bcolors.HEADER+"======================================"
+print "* METEOR DEPLOY USING SSH AUTOMATION *"
+print "======================================"+bcolors.ENDC
+
+deploy_phase = ''
+
+def run_command(command):
+    process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
+    #print command
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            print output.strip()
+    rc = process.poll()
+    return rc
+
+def LoadClients(phase, printTable):
+    f = open ('medusa_clients.json','r')
+    jsonData = json.loads(f.read())
+    settings = jsonData["settings"]
+    clients = jsonData[phase.upper()]
+    f.close()
+    index = 1
+    t = PrettyTable([
+        bcolors.BOLD + 'ID' + bcolors.ENDC,
+        bcolors.BOLD + 'Name' + bcolors.ENDC,
+        bcolors.BOLD + 'Host' + bcolors.ENDC,
+        bcolors.BOLD + 'URL' + bcolors.ENDC,
+        bcolors.BOLD + 'Description' + bcolors.ENDC
+    ])
+    for client in clients:
+        t.add_row([
+            index,
+            client["name"],
+            str(client["ssh"]["host"]) + ":" + str(client["ssh"]["port"]),
+            client["ROOT_URL"],
+            client["description"]
+        ])
+        index += 1
+    if printTable:
+        print t
+    return settings, clients
+
+def PullDatabase(client, settings):
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        logger.info('>>> Pull database from client ' +
+                    bcolors.OKGREEN + client["appName"] + bcolors.ENDC +
+                    ' at remote host ' +
+                    bcolors.OKGREEN + client["ssh"]["host"] + bcolors.ENDC)
+        ssh.connect(client["ssh"]["host"], port= client["ssh"]["port"], username='root')
+        #stdin, stdout, stderr = ssh.exec_command("export LC_ALL=C; " +
+        #Dump database
+        logger.info('>>> Dump database')
+        backupName = client["appName"] + datetime.now().strftime("_%Y-%m-%d_%Hh%M")
+        #Make & go to backup folder
+        stdin, stdout, stderr = ssh.exec_command(
+            "mkdir /opt/" + client["appName"] + "/database;" +
+            "cd /opt/" + client["appName"] + "/database;" +
+            "mongodump --gzip -d " + client["appName"] + " -o " + backupName)
+        #Pull
+        logger.info('>>> Pull to local')
+        run_command("mkdir " + settings["backup"])
+        run_command(
+            'scp -r -P ' + str(client["ssh"]["port"]) +
+            ' root@' + client["ssh"]["host"] +
+            ':/opt/' + client["appName"] + '/database/' + backupName +
+            ' ' + settings["backup"])
+        #Import to mongo meteor local
+        logger.info('>>> Import to mongo instance ' + bcolors.OKGREEN + "localhost:3001" + bcolors.ENDC)
+        run_command('mongo localhost:3001/meteor --eval "db.dropDatabase();"')
+        run_command(
+            'mongorestore --gzip -h 127.0.0.1:3001 -d meteor ' +
+            settings["backup"] + '/' +
+            backupName + '/' + client["appName"] + '/')
+        err = stderr.readlines()
+        #if len(err)>0:
+            #print err
+        ssh.close()
+    except:
+        logger.error(bcolors.FAIL+ str(sys.exc_info()[0]) + bcolors.ENDC)
+
+def SyncDatabase(client, settings):
+    logger.info('>>> Sync database of ' +
+                bcolors.OKGREEN + client["appName"] + bcolors.ENDC +
+                ' from ' +
+                bcolors.OKGREEN + client["ssh"]["host"] + bcolors.ENDC)
+    run_command(
+        'rsync -a --info=progress2 -e "ssh -p ' + str(client["ssh"]["port"]) + '" ' +
+        ' root@' + client["ssh"]["host"] + ':/opt/'+client["appName"] + '/database ' +
+        settings["backup"])
+
+def SwitchDatabase(client, settings):
+    run_command('ls -l ' + settings["backup"])
+    backupName = raw_input('Choose from above: ')
+    logger.info('>>> Switch to database ' + bcolors.OKGREEN + backupName + bcolors.ENDC)
+    run_command('mongo localhost:3001/meteor --eval "db.dropDatabase();"')
+    run_command(
+        'mongorestore --gzip -h 127.0.0.1:3001 -d meteor ' +
+        settings["backup"] + '/' +
+        backupName + '/' + client["appName"] + '/')
+
+def DeployClient(client, settings):
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        logger.info('>>> Deploy to app ' +
+                    bcolors.OKGREEN + client["appName"] + bcolors.ENDC +
+                    ' at remote host ' +
+                    bcolors.OKGREEN + client["ssh"]["host"] + bcolors.ENDC)
+        ssh.connect(client["ssh"]["host"], port= client["ssh"]["port"], username='root')
+        #Remove backup
+        stdin, stdout, stderr = ssh.exec_command("rm -rf /opt/"+client["appName"]+"/backup")
+        #Copy backup
+        stdin, stdout, stderr = ssh.exec_command("cp -R /opt/"+client["appName"] + "/build /opt/"+client["appName"]+"/backup")
+
+        run_command(
+            'rsync -a --info=progress2 -e "ssh -p ' + str(client["ssh"]["port"]) + '" ' +
+            settings["directory"] +
+            ' root@' + client["ssh"]["host"] + ':/opt/'+client["appName"])
+
+        logger.info('>>> Restart ' + bcolors.OKGREEN + client["name"] + bcolors.ENDC)
+        stdin, stdout, stderr = ssh.exec_command(
+            "export NVM_DIR=~/.nvm ; source ~/.nvm/nvm.sh" +
+            "; nvm use " + settings["nodeVersion"] +
+            "; cd /opt/"+client["appName"]+"/build/bundle/programs/server; npm install" +
+            "; cd /opt/"+client["appName"]+"/build/bundle/" +
+            "; pm2 delete " + client["appName"] +
+            ";    PORT=" + str(client["port"]) +
+                " MONGO_URL=" + client["MONGO_URL"] +
+                " ROOT_URL='"+ client["ROOT_URL"] +
+                "' METEOR_SETTINGS='" + client["METEOR_SETTINGS"] +
+                "' pm2 start main.js --name='" +
+                client["appName"] + "'")
+        err = stderr.readlines()
+        #if len(err)>0:
+            #print err
+        ssh.close()
+    except:
+        logger.error(bcolors.FAIL+ str(sys.exc_info()[0]) + bcolors.ENDC)
+
+def BuildDeployClients(clients, deploy_idx, settings):
+    start = datetime.now().replace(microsecond=0)
+    logger.info('>>> Building application')
+    run_command('meteor build --directory '+ settings["directory"])
+    if deploy_idx>0:
+        #SSH to client
+        DeployClient(clients[deploy_idx-1], settings)
+    else:
+        for client in clients:
+             DeployClient(client, settings)
+    done = datetime.now().replace(microsecond=0)
+    print bcolors.OKBLUE+"      ========================="
+    print '      >> TOTAL TIME:'+bcolors.BOLD+bcolors.WARNING, done - start, bcolors.ENDC+bcolors.OKBLUE+'<<'
+    print "      ========================="+bcolors.ENDC
+
+### MAIN PROGRAM
+if len(sys.argv)>1:
+    if str(sys.argv[1]) in ['a','b','A','B']:
+        if sys.argv[1] in ['a','A']:
+            deploy_phase = 'A'
+        else:
+            deploy_phase = 'B'
+        if len(sys.argv)>2:
+            deploy_idx = int(sys.argv[2])
+            settings, clients = LoadClients(deploy_phase, False)
+            if len(sys.argv)> 3:
+                if sys.argv[3] in ['pulldb']:
+                    accept = raw_input(bcolors.WARNING + "Don't pull database at rush hour! Still pull?(YES/no): " + bcolors.ENDC)
+                    if accept in ['YES']:
+                        PullDatabase(clients[deploy_idx-1], settings)
+                    else:
+                        print "Try again later!"
+                elif sys.argv[3] in ['switchdb']:
+                    SwitchDatabase(clients[deploy_idx-1], settings)
+                elif sys.argv[3] in ['syncdb']:
+                    SyncDatabase(clients[deploy_idx-1], settings)
+                else:
+                    print "Wrong command, pls choose between ['pulldb','switchdb','syncdb']"
+            else:
+                if int(sys.argv[2]) > 0:
+                    accept = raw_input('Deploy to client '+ bcolors.OKGREEN + clients[deploy_idx-1]["name"] + bcolors.ENDC +' (Y/n)?')
+                    if accept in ['y','Y','']:
+                        BuildDeployClients(clients, deploy_idx, settings)
+                else:
+                    print bcolors.WARNING + "For safety, can't mass deploy by cmd!" + bcolors.ENDC
+            sys.exit()
+    else:
+        sys.exit()
+
+#STEP 1: Select deploy phase
+while not(deploy_phase in ['A','B']):
+    deploy_phase = raw_input('1. Select deploy phase ('+bcolors.OKGREEN+'A/B'+bcolors.ENDC+'): ')
+    if deploy_phase in ['a','b','A','B','']:
+        if deploy_phase == '':
+            deploy_phase='A'
+        break
+    else:
+        print bcolors.FAIL+'Wrong, pls try again!'+bcolors.ENDC
+
+#STEP 2: Read clients json file
+print '2. You are in deploy phase ' + bcolors.OKGREEN + deploy_phase.upper() + bcolors.ENDC
+settings, clients = LoadClients(deploy_phase, True)
+while True:
+    deploy_idx = input('Choose from '+bcolors.OKGREEN+'1..'+str(len(clients))+bcolors.ENDC+' or '+bcolors.OKGREEN+'0'+bcolors.ENDC+' for all: ')
+    if (deploy_idx >= 0) & (deploy_idx<=len(clients)):
+        break
+    else:
+        print bcolors.FAIL+'Wrong, pls try again!'+bcolors.ENDC
+
+#STEP 3: Build & Deploy
+print '3. BUILD & DEPLOY'
+BuildDeployClients(clients, deploy_idx, settings)

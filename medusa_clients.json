@@ -1,0 +1,37 @@
+{
+  "settings": {
+    "directory": "../build",
+    "backup": "../backupDB",
+    "nodeVersion": "v0.10.40"
+  },
+  "A": [
+    {
+      "name": "[Organization name]",
+      "description": "[App description]",
+      "appName": "[App name]",
+      "port": 4000,
+      "MONGO_URL": "mongodb://localhost:27017/org1",
+      "ROOT_URL": "http://",
+      "METEOR_SETTINGS": "",
+      "ssh": {
+        "host": "[IP/DNS]",
+        "port": 22
+      }
+    }
+  ],
+  "B": [
+    {
+      "name": "[Organization name]",
+      "description": "[App description]",
+      "appName": "[App name]",
+      "port": 4000,
+      "MONGO_URL": "mongodb://localhost:27017/org1",
+      "ROOT_URL": "http://",
+      "METEOR_SETTINGS": "",
+      "ssh": {
+        "host": "[IP/DNS]",
+        "port": 22
+      }
+    }
+  ]
+}
